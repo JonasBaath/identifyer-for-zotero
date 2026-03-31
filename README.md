@@ -1,5 +1,7 @@
 # Identifyer for Zotero
 
+> **Beta** — Core functionality works but edge cases may occur. Feedback welcome via [Issues](https://github.com/JonasBaath/identifyer-for-zotero/issues).
+
 A local desktop app that finds plain-text citations in Word (.docx) and LibreOffice (.odt) documents, matches them against your local Zotero library, and converts them to proper Zotero field codes — ready for formatting with any citation style.
 
 The typical use case is a document that has been written with plain-text citations — either because it was drafted without a reference manager, converted from another format, or received from a collaborator who uses a different system. Identifyer for Zotero bridges the gap: it reads the document as-is, identifies every citation, looks each one up in your Zotero library using fuzzy matching, and produces a new document where all recognised citations have been replaced with live Zotero field codes. NB, the copy will be stripped of any Zotero or EndNote field codes in the original and any tracked changes will be accepted).
