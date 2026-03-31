@@ -58,3 +58,4 @@ The app opens automatically in your default browser at `http://127.0.0.1:7474`.
 - The original document is never modified — output is always saved as a new file
 - Zotero must be closed (or the database unlocked) when running the app
 - The app runs entirely locally — no data leaves your machine
+- You (might) have to "refresh" Zotero in the new document for the field codes to function properly
