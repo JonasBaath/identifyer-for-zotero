@@ -16,7 +16,7 @@ jobs:
 
       - name: Fetch and append traffic data
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.TAFFIC_TOKEN }}
         run: |
           REPO="JonasBaath/identifyer-for-zotero"
           LOG="traffic-log.csv"
