@@ -1,0 +1,51 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: ["3.9", "3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Import check
+        run: |
+          python -c "import citation_parser; print('citation_parser OK')"
+          python -c "import zotero_client; print('zotero_client OK')"
+          python -c "import matcher; print('matcher OK')"
+          python -c "import field_writer; print('field_writer OK')"
+
+      - name: Smoke test — CitationParser on inline string
+        run: |
+          python - <<'EOF'
+          from citation_parser import CitationParser
+          cp = CitationParser.__new__(CitationParser)
+          cp.docx_path = "dummy.docx"
+          cp._doc = None
+          cp._all_paras = []
+          cp._ref_section_start = None
+          cp._ref_text = ""
+          results = cp._parse_paragraph("See (Smith, 2020) and (Jones & Lee, 2019:45).", 0, in_footnote=False)
+          assert len(results) == 2, f"Expected 2 citations, got {len(results)}"
+          assert results[0].authors == ["Smith"], f"Unexpected authors: {results[0].authors}"
+          assert results[0].year == "2020"
+          assert results[1].year == "2019"
+          print(f"Parsed {len(results)} citations OK")
+          EOF
