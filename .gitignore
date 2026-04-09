@@ -31,8 +31,10 @@ Desktop.ini
 # Test / temporary documents
 *.docx
 *.odt
-*.sqlite
 *.db
+# Exclude SQLite files except test fixtures
+*.sqlite
+!tests/fixtures/*.sqlite
 
 # Editor
 .vscode/
@@ -42,3 +44,8 @@ Desktop.ini
 
 # Claude Code
 .claude/
+
+# Test cache
+.pytest_cache/
+.coverage
+htmlcov/
