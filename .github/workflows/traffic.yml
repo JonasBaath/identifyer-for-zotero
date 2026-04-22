@@ -14,64 +14,58 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Fetch and append traffic data
+      - name: Fetch traffic data and upsert log
         env:
           GH_TOKEN: ${{ secrets.TAFFIC_TOKEN }}
         run: |
           REPO="JonasBaath/identifyer-for-zotero"
-          LOG="traffic-log.csv"
+          gh api "repos/$REPO/traffic/views"  > /tmp/views.json
+          gh api "repos/$REPO/traffic/clones" > /tmp/clones.json
 
-          # Create header if file doesn't exist
-          if [ ! -f "$LOG" ]; then
-            echo "date,views,unique_views,clones,unique_clones" > "$LOG"
-          fi
+          python3 <<'PY'
+          import csv, json
+          from pathlib import Path
 
-          # Fetch views and clones
-          VIEWS=$(gh api repos/$REPO/traffic/views)
-          CLONES=$(gh api repos/$REPO/traffic/clones)
+          views  = json.load(open('/tmp/views.json'))['views']
+          clones = json.load(open('/tmp/clones.json'))['clones']
 
-          # Extract today's date
-          TODAY=$(date -u +%Y-%m-%d)
+          rows = {}
+          for v in views:
+              date = v['timestamp'][:10]
+              rows.setdefault(date, {'views': 0, 'unique_views': 0, 'clones': 0, 'unique_clones': 0})
+              rows[date]['views']        = v['count']
+              rows[date]['unique_views'] = v['uniques']
+          for c in clones:
+              date = c['timestamp'][:10]
+              rows.setdefault(date, {'views': 0, 'unique_views': 0, 'clones': 0, 'unique_clones': 0})
+              rows[date]['clones']        = c['count']
+              rows[date]['unique_clones'] = c['uniques']
 
-          # Parse today's numbers (default to 0 if not present)
-          VIEW_COUNT=$(echo "$VIEWS" | python3 -c "
-          import json, sys
-          data = json.load(sys.stdin)
-          today = '$TODAY'
-          for v in data.get('views', []):
-              if v['timestamp'].startswith(today):
-                  print(v['count'], v['uniques'])
-                  sys.exit()
-          print('0 0')
-          ")
-          CLONE_COUNT=$(echo "$CLONES" | python3 -c "
-          import json, sys
-          data = json.load(sys.stdin)
-          today = '$TODAY'
-          for c in data.get('clones', []):
-              if c['timestamp'].startswith(today):
-                  print(c['count'], c['uniques'])
-                  sys.exit()
-          print('0 0')
-          ")
+          log = Path('traffic-log.csv')
+          existing = {}
+          if log.exists():
+              with log.open() as f:
+                  for row in csv.DictReader(f):
+                      existing[row['date']] = row
 
-          V=$(echo $VIEW_COUNT | cut -d' ' -f1)
-          UV=$(echo $VIEW_COUNT | cut -d' ' -f2)
-          C=$(echo $CLONE_COUNT | cut -d' ' -f1)
-          UC=$(echo $CLONE_COUNT | cut -d' ' -f2)
+          for date, data in rows.items():
+              existing[date] = {'date': date, **{k: str(v) for k, v in data.items()}}
 
-          # Append row if date not already logged
-          if ! grep -q "^$TODAY," "$LOG"; then
-            echo "$TODAY,$V,$UV,$C,$UC" >> "$LOG"
-            echo "Logged: $TODAY views=$V unique_views=$UV clones=$C unique_clones=$UC"
-          else
-            echo "Already logged for $TODAY, skipping."
-          fi
+          with log.open('w', newline='') as f:
+              writer = csv.DictWriter(
+                  f, fieldnames=['date','views','unique_views','clones','unique_clones']
+              )
+              writer.writeheader()
+              for date in sorted(existing):
+                  writer.writerow(existing[date])
+
+          print(f"API covered {len(rows)} dates; total rows in log: {len(existing)}")
+          PY
 
       - name: Commit log
         run: |
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add traffic-log.csv
-          git diff --cached --quiet || git commit -m "traffic: $(date -u +%Y-%m-%d)"
+          git diff --cached --quiet || git commit -m "traffic: update $(date -u +%Y-%m-%d)"
           git push
