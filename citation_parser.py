@@ -153,18 +153,22 @@ _PAGE = (
     r")?"
 )
 
+# Abbreviation for "and others" in an author list — covers Latin "et al."
+# (incl. "et. al." typo) and Swedish "m.fl."/"m. fl."/"mfl" (med flera).
+_ET_AL_ALT = r"(?:et\.?\s+al\.?|m\.?\s*fl\.?)"
+
 # Individual unit within a compound paren — uses _NAME_UNIT so multi-word
 # org names like "(Swedish Food Agency, 2025)" are captured in full.
 # The separator between authors and year accepts either a comma or plain
 # whitespace so that "et al. 2017" (no comma) is handled alongside "et al., 2017".
 UNIT_RE = re.compile(
-    r"(?P<authors>" + _INITIALS_OPT + _NAME_UNIT + r"(?:\s*(?:,\s*&|,\s*\band\b|[,&]|\band\b)\s*" + _INITIALS_OPT + _NAME_UNIT + r")*(?:\s+et\.?\s+al\.?)?)"
+    r"(?P<authors>" + _INITIALS_OPT + _NAME_UNIT + r"(?:\s*(?:,\s*&|,\s*\band\b|[,&]|\band\b)\s*" + _INITIALS_OPT + _NAME_UNIT + r")*(?:\s+" + _ET_AL_ALT + r")?)"
     r"(?:\s*,\s*|\s+)(?P<year>" + _YEAR + r")" + _PAGE,
-    re.UNICODE,
+    re.UNICODE | re.IGNORECASE,
 )
 
-# Detects any "et al." variant in an author string (including "et. al.")
-_ET_AL_RE = re.compile(r"\bet\.?\s+al\.?", re.IGNORECASE)
+# Detects any "et al." or "m.fl." variant in an author string
+_ET_AL_RE = re.compile(r"\b" + _ET_AL_ALT, re.IGNORECASE)
 
 # Follow-on bare year inside a compound citation, e.g. the "; 2018a" part of
 # "(Aschemann-Witzel et al. 2017; 2018a)".  Author is inherited from the
@@ -241,8 +245,8 @@ def _extract_locator(text_after_year: str):
 # ---------------------------------------------------------------------------
 
 def _split_authors(raw: str) -> List[str]:
-    """Turn 'Smith & Jones' or 'Smith, Jones' or 'Smith et al.' into list of last names."""
-    raw = re.sub(r"\s+et\.?\s+al\.?", "", raw, flags=re.IGNORECASE)
+    """Turn 'Smith & Jones' or 'Smith, Jones' or 'Smith et al.' / 'Smith m.fl.' into list of last names."""
+    raw = re.sub(r"\s+" + _ET_AL_ALT, "", raw, flags=re.IGNORECASE)
     parts = re.split(r"\s*(?:[,&]|\band\b)\s*", raw)
     # Strip leading initials like "J." or "J.K." that some styles include
     # for disambiguation — we only need the surname for matching.

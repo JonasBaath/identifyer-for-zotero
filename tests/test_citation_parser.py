@@ -42,6 +42,38 @@ class TestParseParagraph:
         assert len(results) == 1
         assert results[0].authors == ["Smith"]
 
+    @pytest.mark.parametrize("text", [
+        "(Smith m.fl., 2020)",
+        "(Smith m. fl., 2020)",
+        "(Smith mfl., 2020)",
+        "(Smith mfl, 2020)",
+        "(Smith M.Fl., 2020)",
+    ])
+    def test_parse_mfl_variants(self, parser, text):
+        """Swedish 'm.fl.' ('med flera') should be treated like 'et al.'"""
+        results = parser._parse_paragraph(text, 0, in_footnote=False)
+        assert len(results) == 1, f"Failed to parse {text!r}"
+        assert results[0].authors == ["Smith"]
+        assert results[0].year == "2020"
+        assert results[0].has_et_al is True
+
+    def test_parse_mfl_in_compound_citation(self, parser):
+        """m.fl. in one unit should not confuse the other unit in a compound."""
+        results = parser._parse_paragraph(
+            "(Smith m.fl., 2020; Jones, 2021)", 0, in_footnote=False
+        )
+        assert len(results) == 2
+        assert results[0].authors == ["Smith"] and results[0].has_et_al is True
+        assert results[1].authors == ["Jones"] and results[1].has_et_al is False
+
+    def test_mfl_inside_word_does_not_false_match(self, parser):
+        """Strings like 'mflSthlm' inside a word must not be taken as m.fl."""
+        results = parser._parse_paragraph(
+            "mflSthlm är en förkortning (Smith, 2020).", 0, in_footnote=False
+        )
+        assert len(results) == 1
+        assert results[0].has_et_al is False
+
     def test_parse_with_locator(self, parser):
         results = parser._parse_paragraph("(Smith, 2020:45)", 0, in_footnote=False)
         assert len(results) == 1
