@@ -216,8 +216,16 @@ class ZoteroClient:
         except Exception:
             return False
 
-    def load_library(self, progress_cb=None) -> List[ZoteroItem]:
-        """Load all library items from the Zotero SQLite database."""
+    def load_library(
+        self,
+        progress_cb=None,
+        collection_id: Optional[int] = None,
+    ) -> List[ZoteroItem]:
+        """Load library items from the Zotero SQLite database.
+
+        If *collection_id* is given, only items belonging to that collection
+        or any of its descendant sub-collections are returned.
+        """
         if not self.db_path.exists():
             raise FileNotFoundError(
                 f"Zotero database not found at {self.db_path}.\n"
@@ -229,7 +237,9 @@ class ZoteroClient:
             tmp_path = tmp.name
         try:
             shutil.copy2(str(self.db_path), tmp_path)
-            items = self._read_database(tmp_path, progress_cb=progress_cb)
+            items = self._read_database(
+                tmp_path, progress_cb=progress_cb, collection_id=collection_id
+            )
         finally:
             try:
                 os.unlink(tmp_path)
@@ -238,6 +248,80 @@ class ZoteroClient:
 
         self._items = items
         return items
+
+    def list_collections(self) -> List[Dict]:
+        """Return all non-trashed collections as a flat list of dicts with
+        keys: ``id`` (int), ``name``, ``parent_id`` (int or None),
+        ``library_id`` (int), ``path`` (``"Parent / Child"`` for display),
+        ``item_count`` (number of direct items, not including sub-collections).
+        """
+        if not self.db_path.exists():
+            raise FileNotFoundError(
+                f"Zotero database not found at {self.db_path}."
+            )
+        with tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            shutil.copy2(str(self.db_path), tmp_path)
+            conn = sqlite3.connect(tmp_path)
+            conn.row_factory = sqlite3.Row
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT c.collectionID as id, c.collectionName as name,
+                           c.parentCollectionID as parent_id,
+                           c.libraryID as library_id
+                    FROM collections c
+                    WHERE c.collectionID NOT IN (
+                        SELECT collectionID FROM deletedCollections
+                    )
+                    ORDER BY c.libraryID, c.collectionName
+                    """
+                ).fetchall()
+                counts = {
+                    r["collectionID"]: r["n"]
+                    for r in conn.execute(
+                        """
+                        SELECT ci.collectionID, COUNT(*) as n
+                        FROM collectionItems ci
+                        JOIN items i ON ci.itemID = i.itemID
+                        WHERE i.itemID NOT IN (SELECT itemID FROM deletedItems)
+                        GROUP BY ci.collectionID
+                        """
+                    )
+                }
+            finally:
+                conn.close()
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+
+        by_id = {r["id"]: dict(r) for r in rows}
+        # Build a "Parent / Child / Grandchild" path for each collection.
+        def _path(cid: int) -> str:
+            names: List[str] = []
+            seen = set()
+            while cid in by_id and cid not in seen:
+                seen.add(cid)
+                rec = by_id[cid]
+                names.append(rec["name"])
+                cid = rec["parent_id"]
+            return " / ".join(reversed(names))
+
+        out: List[Dict] = []
+        for r in rows:
+            out.append({
+                "id": r["id"],
+                "name": r["name"],
+                "parent_id": r["parent_id"],
+                "library_id": r["library_id"],
+                "path": _path(r["id"]),
+                "item_count": counts.get(r["id"], 0),
+            })
+        out.sort(key=lambda c: (c["library_id"], c["path"].lower()))
+        return out
 
     @property
     def items(self) -> List[ZoteroItem]:
@@ -249,16 +333,47 @@ class ZoteroClient:
     # Database reading
     # ------------------------------------------------------------------
 
-    def _read_database(self, db_path: str, progress_cb=None) -> List[ZoteroItem]:
+    def _read_database(
+        self,
+        db_path: str,
+        progress_cb=None,
+        collection_id: Optional[int] = None,
+    ) -> List[ZoteroItem]:
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
         try:
             user_id = self._get_user_id(conn)
             self._user_id = user_id
-            items = self._fetch_items(conn, user_id, progress_cb=progress_cb)
+            items = self._fetch_items(
+                conn, user_id,
+                progress_cb=progress_cb,
+                collection_id=collection_id,
+            )
         finally:
             conn.close()
         return items
+
+    @staticmethod
+    def _collect_descendant_ids(
+        conn: sqlite3.Connection, root_id: int
+    ) -> List[int]:
+        """Return *root_id* plus every descendant collectionID."""
+        rows = conn.execute(
+            "SELECT collectionID, parentCollectionID FROM collections"
+        ).fetchall()
+        children: Dict[int, List[int]] = {}
+        for r in rows:
+            pid = r["parentCollectionID"]
+            if pid is not None:
+                children.setdefault(pid, []).append(r["collectionID"])
+        result = [root_id]
+        stack = [root_id]
+        while stack:
+            cur = stack.pop()
+            for child in children.get(cur, []):
+                result.append(child)
+                stack.append(child)
+        return result
 
     @staticmethod
     def _get_user_id(conn: sqlite3.Connection) -> str:
@@ -283,10 +398,27 @@ class ZoteroClient:
         return "0"
 
     def _fetch_items(
-        self, conn: sqlite3.Connection, user_id: str, progress_cb=None
+        self,
+        conn: sqlite3.Connection,
+        user_id: str,
+        progress_cb=None,
+        collection_id: Optional[int] = None,
     ) -> List[ZoteroItem]:
         # Get item type IDs to exclude (attachments=14, notes=1)
         excluded_type_ids = self._get_excluded_type_ids(conn)
+
+        # If a collection was requested, restrict to items in that collection
+        # or any of its descendants.
+        collection_clause = ""
+        params: tuple = ()
+        if collection_id is not None:
+            ids = self._collect_descendant_ids(conn, collection_id)
+            placeholders = ",".join("?" for _ in ids)
+            collection_clause = (
+                f" AND i.itemID IN (SELECT itemID FROM collectionItems "
+                f"WHERE collectionID IN ({placeholders}))"
+            )
+            params = tuple(ids)
 
         # Get all non-deleted, non-attachment items
         rows = conn.execute(
@@ -299,8 +431,13 @@ class ZoteroClient:
               AND i.itemID NOT IN (
                   SELECT itemID FROM deletedItems
               )
+              {collection_clause}
             ORDER BY i.dateAdded DESC
-            """.format(excluded=",".join(str(x) for x in excluded_type_ids))
+            """.format(
+                excluded=",".join(str(x) for x in excluded_type_ids),
+                collection_clause=collection_clause,
+            ),
+            params,
         ).fetchall()
 
         if not rows:

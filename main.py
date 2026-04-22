@@ -32,6 +32,15 @@ except ImportError as e:
     IMPORT_ERROR = str(e)
     _DEFAULT_DB = str(Path.home() / "Zotero" / "zotero.sqlite")
 
+from config import load_settings, update_setting
+
+# Prefer the user's most recently used DB path (if still valid) over the
+# platform-autodetected one, so users who keep Zotero in a non-standard
+# location don't have to re-pick it every time.
+_saved_db = (load_settings().get("db_path") or "").strip()
+if _saved_db and Path(_saved_db).exists():
+    _DEFAULT_DB = _saved_db
+
 
 # ---------------------------------------------------------------------------
 # Shared analysis state (single-user local app)
@@ -70,6 +79,7 @@ def _run_analysis(
     author_threshold: int = 82,
     candidate_threshold: int = 60,
     year_tolerance: int = 1,
+    collection_id: Optional[int] = None,
 ):
     try:
         _set_state(status="running", progress=5, message="Loading Zotero library…")
@@ -80,7 +90,9 @@ def _run_analysis(
             if total:
                 _set_state(progress=5 + int(40 * done / total))
 
-        library = client.load_library(progress_cb=lib_progress)
+        library = client.load_library(
+            progress_cb=lib_progress, collection_id=collection_id
+        )
         _set_state(
             progress=45,
             message=f"Loaded {len(library):,} items. Parsing document…",
@@ -380,6 +392,14 @@ _HTML = """<!DOCTYPE html>
     <input id="dbPath" type="text" />
     <button onclick="browse('db')">Browse…</button>
   </div>
+  <div class="field-row">
+    <label>Collection</label>
+    <select id="collectionSelect" style="flex:1; padding:7px 10px;
+            border:1px solid #ccc; border-radius:6px; font-size:0.9rem;
+            background:#fff;">
+      <option value="">Whole library</option>
+    </select>
+  </div>
   <div class="field-row" style="margin-bottom:0">
     <label>Zotero app</label>
     <span id="zoteroStatus" class="status-badge off">○ Checking…</span>
@@ -459,17 +479,49 @@ let acceptedDisplays  = new Set();       // display texts of accepted year-sugge
 let dismissedDisplays = new Set();       // display texts of dismissed year-suggestions
 let manuallyUnmatched = new Set();       // display texts of manually unmatched confirmed matches
 let selectedCandidates = new Map();      // display text → {candidateIndex, key, title, year, authors, confidence}
+let savedCollectionId = null;            // restored from /state, applied once dropdown is filled
 
 // ---- Initialise ----
 window.onload = () => {
   fetch('/state').then(r => r.json()).then(s => {
     document.getElementById('docxPath').value = s.docx_path || '';
-    document.getElementById('dbPath').value = s.db_path || '';
+    const dbInput = document.getElementById('dbPath');
+    dbInput.value = s.db_path || '';
+    savedCollectionId = s.collection_id || null;
+    if (dbInput.value) loadCollections(dbInput.value);
+    // Reload the collection dropdown whenever the DB path is edited manually.
+    dbInput.addEventListener('change', () => {
+      savedCollectionId = null;  // don't re-apply after user switches DBs
+      loadCollections(dbInput.value);
+    });
   });
   checkImportError();
   checkZoteroStatus();
   setInterval(checkZoteroStatus, 30000);
 };
+
+function loadCollections(db) {
+  const sel = document.getElementById('collectionSelect');
+  sel.innerHTML = '<option value="">Whole library</option>';
+  if (!db) return;
+  fetch('/collections?db=' + encodeURIComponent(db))
+    .then(r => r.json())
+    .then(d => {
+      if (!d.ok || !d.collections) return;
+      for (const c of d.collections) {
+        const opt = document.createElement('option');
+        opt.value = c.id;
+        opt.textContent = c.path + '  (' + c.item_count + ')';
+        sel.appendChild(opt);
+      }
+      if (savedCollectionId != null) {
+        sel.value = String(savedCollectionId);
+        // Clear so that a later dbPath edit doesn't re-apply the stale ID.
+        savedCollectionId = null;
+      }
+    })
+    .catch(() => {});
+}
 
 function checkImportError() {
   fetch('/import-error').then(r => r.json()).then(d => {
@@ -498,8 +550,13 @@ function browse(type) {
     body: JSON.stringify({type})
   }).then(r => r.json()).then(d => {
     if (d.path) {
-      if (type === 'docx') document.getElementById('docxPath').value = d.path;
-      else                 document.getElementById('dbPath').value   = d.path;
+      if (type === 'docx') {
+        document.getElementById('docxPath').value = d.path;
+      } else {
+        document.getElementById('dbPath').value = d.path;
+        savedCollectionId = null;
+        loadCollections(d.path);
+      }
     }
   });
 }
@@ -533,10 +590,14 @@ function analyze() {
   selectedCandidates.clear();
   clearResults();
 
+  const cidRaw = document.getElementById('collectionSelect').value;
+  const collection_id = cidRaw ? parseInt(cidRaw, 10) : null;
+
   fetch('/analyze', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({docx_path: docx, db_path: db, ...getThresholds()})
+    body: JSON.stringify({docx_path: docx, db_path: db, collection_id,
+                          ...getThresholds()})
   }).then(() => {
     pollTimer = setInterval(pollStatus, 400);
   });
@@ -912,7 +973,11 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/state":
             s = _get_state()
-            self._send_json({"docx_path": s["docx_path"], "db_path": s["db_path"]})
+            self._send_json({
+                "docx_path": s["docx_path"],
+                "db_path": s["db_path"],
+                "collection_id": load_settings().get("collection_id"),
+            })
 
         elif path == "/status":
             s = _get_state()
@@ -933,6 +998,23 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/import-error":
             self._send_json({"error": IMPORT_ERROR})
+
+        elif path == "/collections":
+            if IMPORT_ERROR:
+                self._send_json({"ok": False, "error": IMPORT_ERROR, "collections": []})
+                return
+            # Optional ?db=... override; falls back to current state.
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(self.path).query)
+            db = (qs.get("db", [""])[0] or _get_state()["db_path"]).strip()
+            if not db:
+                self._send_json({"ok": False, "error": "No DB path.", "collections": []})
+                return
+            try:
+                cols = ZoteroClient(db).list_collections()
+                self._send_json({"ok": True, "collections": cols})
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e), "collections": []})
 
         else:
             self.send_error(404)
@@ -964,6 +1046,17 @@ class Handler(BaseHTTPRequestHandler):
             author_thresh    = int(data.get("author_threshold",    82))
             candidate_thresh = int(data.get("candidate_threshold", 60))
             year_tol         = int(data.get("year_tolerance",       1))
+            # collection_id may be an integer, missing, or the sentinel 0 / ""
+            # meaning "whole library".
+            raw_cid = data.get("collection_id")
+            try:
+                cid: Optional[int] = int(raw_cid) if raw_cid else None
+            except (TypeError, ValueError):
+                cid = None
+            # Persist DB path and collection choice so they're prefilled next time.
+            if db:
+                update_setting("db_path", db)
+            update_setting("collection_id", cid if cid else None)
             _set_state(
                 docx_path=docx,
                 db_path=db,
@@ -977,7 +1070,7 @@ class Handler(BaseHTTPRequestHandler):
             )
             threading.Thread(
                 target=_run_analysis,
-                args=(docx, db, author_thresh, candidate_thresh, year_tol),
+                args=(docx, db, author_thresh, candidate_thresh, year_tol, cid),
                 daemon=True,
             ).start()
             self._send_json({"ok": True})

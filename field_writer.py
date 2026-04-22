@@ -501,8 +501,6 @@ class FieldWriter:
                     zotero_field = True
 
             elif elem.tag == r_tag:
-                if in_zotero_result:
-                    continue
                 # Skip runs inside <w:del>
                 ancestor = elem.getparent()
                 in_del = False
@@ -513,9 +511,19 @@ class FieldWriter:
                     ancestor = ancestor.getparent()
                 if in_del:
                     continue
+                text = FieldWriter._get_run_text(elem)
+                if in_zotero_result:
+                    # Advance offset past the display text of an existing
+                    # Zotero field, but don't emit a span — this keeps
+                    # subsequent offsets aligned with the original-text
+                    # positions used by Citation objects, and ensures that
+                    # citations whose span falls inside an already-inserted
+                    # field cannot locate a run to split (returning early
+                    # instead of corrupting the surrounding text).
+                    offset += len(text)
+                    continue
                 parent = elem.getparent()
                 in_ins = parent is not None and parent.tag == ins_tag
-                text = FieldWriter._get_run_text(elem)
                 spans.append((elem, offset, offset + len(text), in_ins))
                 offset += len(text)
 
