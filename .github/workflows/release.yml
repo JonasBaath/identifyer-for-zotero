@@ -68,8 +68,49 @@ jobs:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_name }}.${{ matrix.archive_ext }}
 
+  build-macos-intel:
+    runs-on: macos-14
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up x86_64 Python (Rosetta)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: 'x64'
+
+      - name: Verify Rosetta + arch
+        run: |
+          arch -x86_64 python -c "import platform; print('machine:', platform.machine())"
+
+      - name: Install dependencies (x86_64)
+        run: |
+          arch -x86_64 python -m pip install --upgrade pip
+          arch -x86_64 python -m pip install -r requirements.txt
+          arch -x86_64 python -m pip install pyinstaller
+
+      - name: Build with PyInstaller (x86_64)
+        run: |
+          arch -x86_64 python -m PyInstaller --onefile --console \
+            --name identifyer-for-zotero \
+            --collect-all lxml \
+            --collect-all rapidfuzz \
+            main.py
+
+      - name: Package binary
+        run: |
+          cd dist
+          zip ../identifyer-for-zotero-macos-x64.zip identifyer-for-zotero
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: identifyer-for-zotero-macos-x64
+          path: identifyer-for-zotero-macos-x64.zip
+
   release:
-    needs: build
+    needs: [build, build-macos-intel]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -84,5 +125,5 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: artifacts/**/*
-          fail_on_unmatched_files: true
+          fail_on_unmatched_files: false
           generate_release_notes: true
