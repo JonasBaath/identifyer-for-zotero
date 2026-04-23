@@ -20,10 +20,6 @@ jobs:
             artifact_name: identifyer-for-zotero-windows-x64
             archive_ext: zip
             binary_name: identifyer-for-zotero.exe
-          - os: macos-13
-            artifact_name: identifyer-for-zotero-macos-x64
-            archive_ext: zip
-            binary_name: identifyer-for-zotero
           - os: macos-14
             artifact_name: identifyer-for-zotero-macos-arm64
             archive_ext: zip
