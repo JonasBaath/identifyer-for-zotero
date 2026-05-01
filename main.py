@@ -111,6 +111,7 @@ def _run_analysis(
             author_threshold=author_threshold,
             candidate_threshold=candidate_threshold,
             year_tolerance=year_tolerance,
+            bibliography=parser.author_year_ref_map,
         )
 
         def match_progress(done, total):
@@ -155,6 +156,8 @@ def _run_analysis(
                 "ref_text": cit.ref_text,
                 "prefix": cit.prefix,
                 "suffix": cit.suffix,
+                "is_last_resort": r.is_last_resort,
+                "bibliography_hint": r.bibliography_hint,
             })
 
         matched   = sum(1 for r in results if r.matched)
@@ -777,8 +780,22 @@ function _render() {
         </tr>`;
       } else {
         const refHint = r.ref_text ? `<div style="font-size:0.78rem;color:#666;margin-top:4px">Ref: ${esc(r.ref_text.substring(0,120))}${r.ref_text.length>120?'…':''}</div>` : '';
+        // Last-resort fallback: closest bibliography entry (preferred) or
+        // closest Zotero item ignoring year. Signals to the user "this is
+        // the only candidate we could find — if it looks unrelated, the
+        // reference is probably missing from both."
+        let lastResortHint = '';
+        if (r.is_last_resort) {
+          const bib = r.bibliography_hint
+            ? `<div style="font-size:0.78rem;color:#b8860b;margin-top:4px">Bibliography (closest): ${esc(r.bibliography_hint.substring(0,140))}${r.bibliography_hint.length>140?'…':''}</div>`
+            : '';
+          const zot = r.zotero_key
+            ? `<div style="font-size:0.78rem;color:#b8860b;margin-top:4px">Zotero (year ignored): [${esc(r.zotero_key)}] ${esc(r.zotero_authors.join(', '))} (${esc(r.zotero_year)}) — ${esc(r.zotero_title)}</div>`
+            : '';
+          lastResortHint = bib + zot;
+        }
         return `<tr>
-          <td><span class="badge-no">✗</span> ${esc(r.display)}${refHint}</td>
+          <td><span class="badge-no">✗</span> ${esc(r.display)}${refHint}${lastResortHint}</td>
           <td>${r.in_footnote ? 'footnote' : 'para ' + (r.para+1)}</td>
           <td></td>
         </tr>`;

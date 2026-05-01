@@ -42,6 +42,13 @@ class MatchResult:
     suggestion_year: str = ""     # the actual year found in Zotero for this suggestion
     is_ambiguous: bool = False    # True = multiple library items match equally well
     candidates: List = field(default_factory=list)  # [(ZoteroItem, float), ...] sorted desc
+    # Last-resort fallback used when no normal pass found a candidate.
+    # Surfaces the closest thing in the document's bibliography or in Zotero
+    # so the user can tell whether the reference is genuinely missing or just
+    # has a typo'd year/author. If the hint is clearly wrong, the reference
+    # is almost certainly absent from both.
+    is_last_resort: bool = False
+    bibliography_hint: str = ""   # closest matching reference-list entry text
 
     def summary(self) -> str:
         if self.is_suggestion and self.zotero_item:
@@ -80,11 +87,16 @@ class CitationMatcher:
         author_threshold: int = AUTHOR_THRESHOLD,
         candidate_threshold: int = CANDIDATE_THRESHOLD,
         year_tolerance: int = 1,
+        bibliography: Optional[dict] = None,
     ):
         self.library = library
         self._author_threshold    = author_threshold
         self._candidate_threshold = candidate_threshold
         self._year_tolerance      = year_tolerance
+        # Document's reference list, keyed by (surname_lower, year). Used as a
+        # last-resort fallback so genuine year typos surface the bibliography
+        # entry the user wrote.
+        self._bibliography = bibliography or {}
         # Build year-indexed lookup for fast pre-filtering
         self._by_year: dict[str, List[ZoteroItem]] = {}
         for item in library:
@@ -143,6 +155,20 @@ class CitationMatcher:
                 return MatchResult(citation=citation, zotero_item=best_item,
                                    confidence=best_conf, matched=False,
                                    is_ambiguous=True, candidates=low_candidates)
+
+            # Last-resort: check whether the document's bibliography has an
+            # entry with the same surname (any year). If yes, surface it so
+            # the user can fix a year typo. Otherwise try Zotero ignoring
+            # the year. If both come up empty, the reference is almost
+            # certainly absent from both.
+            bib_hint = self._best_bibliography_guess(citation)
+            zot_guess = self._best_zotero_guess(citation)
+            if bib_hint or zot_guess is not None:
+                item, conf = (zot_guess if zot_guess is not None else (None, 0.0))
+                return MatchResult(citation=citation, zotero_item=item,
+                                   confidence=conf, matched=False,
+                                   is_last_resort=True,
+                                   bibliography_hint=bib_hint)
 
             return MatchResult(citation=citation, zotero_item=None,
                                confidence=0.0, matched=False)
@@ -369,6 +395,63 @@ class CitationMatcher:
 
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:5]
+
+    # ------------------------------------------------------------------
+    # Last-resort fallback (bibliography → Zotero ignoring year)
+    # ------------------------------------------------------------------
+
+    # Confidence floor for last-resort hints. Below this, the suggestion is
+    # too unrelated to be worth showing — better a bare "unmatched" than
+    # noise.
+    _LAST_RESORT_THRESHOLD = 0.70
+
+    def _best_bibliography_guess(self, citation: Citation) -> str:
+        """Return the closest reference-list entry text whose surname fuzzy-matches
+        the citation's first author. Empty string if the bibliography has no
+        candidate above the last-resort threshold.
+        """
+        if not self._bibliography or not citation.authors:
+            return ""
+        cit_surname = _strip_particles(citation.authors[0]).lower()
+        best_score = 0.0
+        best_text = ""
+        for (surname, _year), text in self._bibliography.items():
+            if not surname:
+                continue
+            score = fuzz.ratio(cit_surname, surname.lower()) / 100.0
+            if score > best_score:
+                best_score = score
+                best_text = text
+        if best_score >= self._LAST_RESORT_THRESHOLD:
+            return best_text
+        return ""
+
+    def _best_zotero_guess(
+        self, citation: Citation
+    ) -> Optional[Tuple[ZoteroItem, float]]:
+        """Return the closest Zotero item by author surname, ignoring year.
+        Used only as a last-resort hint.
+        """
+        if not citation.authors:
+            return None
+        cit_surname = _strip_particles(citation.authors[0]).lower()
+        best_item: Optional[ZoteroItem] = None
+        best_score = 0.0
+        for item in self.library:
+            names = item.authors if item.authors else item.editors
+            if not names:
+                continue
+            item_surname = _strip_particles(names[0]).lower()
+            if not item_surname or item_surname[0] != cit_surname[0]:
+                continue
+            score = fuzz.ratio(cit_surname, item_surname) / 100.0
+            if score > best_score:
+                best_score = score
+                best_item = item
+        if best_item is not None and best_score >= self._LAST_RESORT_THRESHOLD:
+            # Heavy penalty: the user must be told this is a year-agnostic guess.
+            return best_item, best_score * 0.50
+        return None
 
     def _try_year_tolerance(
         self, citation: Citation, tolerance: int = 1

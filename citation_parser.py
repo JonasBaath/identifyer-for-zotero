@@ -93,8 +93,9 @@ class Citation:
 # Regex patterns
 # ---------------------------------------------------------------------------
 
-# Last-name token: capitalised word (may include hyphens/apostrophes)
-_NAME = r"[A-Z][A-Za-zÀ-ÿ'\-]+"
+# Last-name token: capitalised word (may include hyphens, straight or curly
+# apostrophes — Word auto-corrects ' to U+2019 in many configurations).
+_NAME = r"[A-Z][A-Za-zÀ-ÿ'’\-]+"
 # Nobiliary particles (van, de, von, etc.) that may precede a capitalised surname
 _PARTICLE_WORDS = (
     "van", "von", "de", "du", "da", "di", "del", "della", "der", "den",
@@ -155,25 +156,42 @@ _PAGE = (
 
 # Abbreviation for "and others" in an author list — covers Latin "et al."
 # (incl. "et. al." typo) and Swedish "m.fl."/"m. fl."/"mfl" (med flera).
-_ET_AL_ALT = r"(?:et\.?\s+al\.?|m\.?\s*fl\.?)"
+# Inline (?i:…) makes the alternation case-insensitive even when embedded in
+# a case-sensitive parent regex (UNIT_RE).
+_ET_AL_ALT = r"(?i:et\.?\s+al\.?|m\.?\s*fl\.?)"
 
 # Individual unit within a compound paren — uses _NAME_UNIT so multi-word
 # org names like "(Swedish Food Agency, 2025)" are captured in full.
 # The separator between authors and year accepts either a comma or plain
 # whitespace so that "et al. 2017" (no comma) is handled alongside "et al., 2017".
+# Case-sensitive on author tokens: surnames must be capitalised so prose
+# words ("the", "of", "common humanity") cannot be matched as authors.
 UNIT_RE = re.compile(
     r"(?P<authors>" + _INITIALS_OPT + _NAME_UNIT + r"(?:\s*(?:,\s*&|,\s*\band\b|[,&]|\band\b)\s*" + _INITIALS_OPT + _NAME_UNIT + r")*(?:\s+" + _ET_AL_ALT + r")?)"
     r"(?:\s*,\s*|\s+)(?P<year>" + _YEAR + r")" + _PAGE,
-    re.UNICODE | re.IGNORECASE,
+    re.UNICODE,
 )
 
 # Detects any "et al." or "m.fl." variant in an author string
-_ET_AL_RE = re.compile(r"\b" + _ET_AL_ALT, re.IGNORECASE)
+_ET_AL_RE = re.compile(r"\b" + _ET_AL_ALT)
 
 # Follow-on bare year inside a compound citation, e.g. the "; 2018a" part of
 # "(Aschemann-Witzel et al. 2017; 2018a)".  Author is inherited from the
 # most recent preceding UNIT_RE match in the same parenthetical.
 BARE_YEAR_RE = re.compile(r"[;,]\s*(?P<year>" + _YEAR + r")\b", re.IGNORECASE)
+
+# Leading bare year + optional locator at the very start of a parenthetical,
+# e.g. the "2014, 20" part of "Lane (2014, 20; cf. Bildtgård 2010)". When
+# this matches, the author lives BEFORE the open paren and must be picked
+# up via backward scan in the surrounding paragraph text.
+LEADING_YEAR_RE = re.compile(
+    r"^\s*(?P<year>" + _YEAR + r")"
+    r"(?P<after>"
+    r"(?:[,:]\s*(?:pp?\.\s*|ch\.\s*|sec\.\s*)\d{1,4}(?:\s*[–\-]\s*\d{1,4})?)"
+    r"|(?:[,:]\s*\d{1,3}(?!\d)(?:\s*[–\-]\s*\d{1,3}(?!\d))?)"
+    r")?",
+    re.UNICODE,
+)
 
 # Inline narrative: Smith (2023) — still anchored to a single _NAME word;
 # multi-word org names are extended backwards in _parse_paragraph.
@@ -246,26 +264,37 @@ def _extract_locator(text_after_year: str):
 
 def _split_authors(raw: str) -> List[str]:
     """Turn 'Smith & Jones' or 'Smith, Jones' or 'Smith et al.' / 'Smith m.fl.' into list of last names."""
-    raw = re.sub(r"\s+" + _ET_AL_ALT, "", raw, flags=re.IGNORECASE)
+    raw = re.sub(r"\s+" + _ET_AL_ALT, "", raw)
     parts = re.split(r"\s*(?:[,&]|\band\b)\s*", raw)
     # Strip leading initials like "J." or "J.K." that some styles include
     # for disambiguation — we only need the surname for matching.
+    # Also strip a single uppercase letter followed by whitespace ("M Nilsson")
+    # so it isn't kept as part of the surname.
+    # Also strip a trailing possessive (Smith's → Smith) so fuzzy matching
+    # against the bibliography compares clean surnames.
     cleaned = []
     for p in parts:
-        p = re.sub(r'^(?:[A-Z]\.[\s-]*)+', '', p).strip()
+        p = re.sub(r'^(?:(?:[A-Z]\.[\s-]*)|(?:[A-Z]\s+))+', '', p).strip()
+        p = re.sub(r"['’]s$", "", p)
         if p:
             cleaned.append(p)
     return cleaned
 
 
 def _first_surname_key(author: str) -> str:
-    """Extract the first capitalised surname from an author name, skipping particles."""
-    # Split into words and skip leading particles (le, van, de, …)
+    """Extract the first capitalised surname from an author name, skipping
+    particles (le, van, de, …) and bare initials (M, M., J.K.)."""
     words = author.split()
     for w in words:
-        if w.lower() not in _PARTICLES_SET:
-            # Return the first non-particle word
-            return w.lower()
+        if w.lower() in _PARTICLES_SET:
+            continue
+        # Single uppercase letter ("M") or a 2-char initial ("M.") — initial,
+        # not surname.
+        if len(w) == 1 and w.isupper():
+            continue
+        if len(w) == 2 and w[0].isupper() and w[1] == '.':
+            continue
+        return w.lower()
     # Fallback: return first word if all words are particles (shouldn't happen)
     return words[0].lower() if words else author.lower()
 
@@ -292,6 +321,154 @@ _VALID_PREFIX_RE = re.compile(
     r'hereafter|as|cited|in|following|after)\b[,;.\s]*)+$',
     re.IGNORECASE,
 )
+
+
+# Tokens that introduce a citation rather than naming an author.
+# Matched at the start of a parenthetical or immediately after a `;` so
+# UNIT_RE never sees them as candidate author names. Listed without
+# anchoring; _PREFIX_MASK_RE handles the position constraint.
+_PREFIX_TOKEN_RE = (
+    r'see\s+also|see|also|'
+    r'e\.?\s*g\.?|i\.?\s*e\.?|cf\.?|'
+    r'compare|contra|pace|hereafter|cited|following'
+)
+_PREFIX_MASK_RE = re.compile(
+    r'(?:^|(?<=[;]))\s*(?:(?:' + _PREFIX_TOKEN_RE + r')\b\s*[,.]?\s*)+',
+    re.IGNORECASE,
+)
+
+
+def _mask_prefix_tokens(inner: str) -> str:
+    """Replace citation-prefix tokens (see, cf., e.g., …) at the start of a
+    parenthetical or after a `;` with spaces of equal length. Length is
+    preserved so character offsets in the original string still align.
+    """
+    return _PREFIX_MASK_RE.sub(lambda m: ' ' * (m.end() - m.start()), inner)
+
+
+# Reused by both inline parsing and the leading-year-in-paren handler.
+_PREV_WORD_RE = re.compile(r"([A-Za-zÀ-ÿ'’\-]+)\s*$")
+_QUOTE_PAIRS = {'”': '“', '’': '‘', '"': '"', "'": "'"}
+
+
+def _skip_quoted_span(text: str, pos: int) -> int:
+    """If the text immediately before `pos` (after whitespace) ends with a
+    closing quotation mark, skip back past the matching opening mark and
+    return the new position. Otherwise return `pos` unchanged.
+    Handles both curly (`“…”`, `‘…’`) and straight (`"…"`, `'…'`) pairs.
+    """
+    p = pos
+    while p > 0 and text[p - 1].isspace():
+        p -= 1
+    if p == 0 or text[p - 1] not in _QUOTE_PAIRS:
+        return pos
+    close = text[p - 1]
+    open_q = _QUOTE_PAIRS[close]
+    if open_q == close:
+        # Ambiguous straight quote — find the most recent occurrence before p-1.
+        opening = text.rfind(open_q, 0, p - 1)
+    else:
+        opening = text.rfind(open_q, 0, p - 1)
+    if opening < 0:
+        return pos
+    return opening
+
+
+def _find_narrative_author(text: str, pos: int) -> str:
+    """Scan backwards from `pos` for a capitalised surname pattern within the
+    current sentence. Used as a fallback when the immediate-back scan can't
+    find a name because a quoted span intervenes. Stops at sentence
+    boundaries (`. ` followed by an uppercase letter) to avoid pulling
+    authors from previous sentences.
+    """
+    # Find sentence start: scan back for `. ` + uppercase letter, or paragraph start.
+    sentence_start = 0
+    for m in re.finditer(r'\.\s+(?=[A-Z])', text[:pos]):
+        sentence_start = m.end()
+    sentence = text[sentence_start:pos]
+    # Find the LAST capitalised name pattern in the sentence. Patterns:
+    #   - Possessive: "Lane's", "Lane’s"
+    #   - Verb-led: "Lane argues/notes/observes/…"
+    #   - Plain capitalised name(s) followed by a verb
+    # Use a single regex that captures one or two capitalised words optionally
+    # joined by "and".
+    name_re = re.compile(
+        r"\b("                                   # group: full name
+        r"(?:" + _PARTICLE_PREFIX + r")?"        # optional particle
+        r"[A-Z][A-Za-zÀ-ÿ'’\-]+"                 # surname
+        r"(?:[-\s](?:and\s+)?"                   # optional " and " connector
+        r"(?:" + _PARTICLE_PREFIX + r")?"
+        r"[A-Z][A-Za-zÀ-ÿ'’\-]+)?"
+        r")"
+        r"(?:['’]s\b|\s+(?:argues?|argued|notes?|noted|observes?|observed|"
+        r"writes?|wrote|claims?|claimed|describes?|described|discusses?|"
+        r"discussed|emphasi[sz]es?|emphasi[sz]ed|dismisse?s?|dismissed|"
+        r"promotes?|promoted|proposes?|proposed|insists?|insisted|"
+        r"says?|said|holds?|held|finds?|found|shows?|showed|posits?|posited|"
+        r"suggests?|suggested|states?|stated|maintains?|maintained))",
+        re.UNICODE,
+    )
+    last = None
+    for m in name_re.finditer(sentence):
+        last = m
+    if last is None:
+        return ""
+    candidate = last.group(1).strip()
+    # Reject if first word is a sentence-stopword like "The", "A", "However"
+    first_word = candidate.split()[0]
+    if first_word in _INLINE_STOPWORDS:
+        return ""
+    return candidate
+
+
+def _scan_author_before(text: str, pos: int) -> str:
+    """Scan backwards from `pos` in `text` to assemble the author name(s)
+    immediately preceding it. Used for narrative citations like
+    "Lane (2014, 20; cf. Bildtgård 2010)" where the author for the leading
+    year lives outside the parenthetical.
+
+    Returns the assembled author string (e.g. "Koponen and Niva", "Lane",
+    "van der Berg") or "" if no capitalised name is found.
+    """
+    # If the paren is preceded by a quoted span (`"…" (year, …)`),
+    # the author may live BEFORE the quote — skip the quoted span first.
+    pos_after_quote_skip = _skip_quoted_span(text, pos)
+
+    author = ""
+    scan_pos = pos_after_quote_skip
+    while scan_pos > 0:
+        before = text[:scan_pos]
+        pm = _PREV_WORD_RE.search(before)
+        if not pm:
+            break
+        word = pm.group(1)
+        if word[0].isupper() and word not in _INLINE_STOPWORDS:
+            author = word + (" " + author if author else "")
+            scan_pos = pm.start(1)
+        elif word.lower() in _PARTICLES_SET:
+            author = word + (" " + author if author else "")
+            scan_pos = pm.start(1)
+        elif word.lower() == "and" and author:
+            # "Koponen and Niva (...)" — connector between co-authors.
+            pre_text = text[:pm.start(1)]
+            pm2 = _PREV_WORD_RE.search(pre_text)
+            if (
+                pm2
+                and pm2.group(1)[0].isupper()
+                and pm2.group(1) not in _INLINE_STOPWORDS
+            ):
+                author = pm2.group(1) + " " + word + " " + author
+                scan_pos = pm2.start(1)
+            else:
+                break
+        else:
+            break
+    if author:
+        return author.strip()
+    # Direct adjacency failed (typical Chicago "X argued ‘…’ (year, p.)"
+    # pattern). Fall back to a sentence-level scan for a verb-led or
+    # possessive author mention.
+    return _find_narrative_author(text, pos)
 
 
 def _extract_prefix_suffix(
@@ -695,13 +872,57 @@ class CitationParser:
             inner_clean = re.sub(
                 r',?\s*\b(?:Eds?|eds?|Trans|trans)\.\s*,?', '', inner_clean
             )
-            sub_units = list(UNIT_RE.finditer(inner_clean))
+            # Mask citation-prefix tokens (see, cf., e.g., …) so they aren't
+            # picked up as authors by UNIT_RE. Length is preserved so positions
+            # still align with inner_clean for prefix/suffix gap extraction.
+            inner_for_match = _mask_prefix_tokens(inner_clean)
+            sub_units = list(UNIT_RE.finditer(inner_for_match))
+
+            # Detect "Author (year, page; sub-citations…)" — paren starts with
+            # a year so the author lives in the surrounding paragraph text.
+            # We synthesise an inline-style citation for this leading year and
+            # let UNIT_RE handle the rest of the chunk normally.
+            # Only run when the chunk is COMPOUND (has at least one UNIT_RE
+            # sub-citation); the bare narrative case "Author (2020)" is already
+            # captured by INLINE_RE below, and synthesising here would duplicate.
+            leading_inline: Optional[Citation] = None
+            m_lead = LEADING_YEAR_RE.match(inner_clean)
+            starts_with_year = (
+                m_lead is not None
+                and sub_units
+                and sub_units[0].start() >= m_lead.end()
+            )
+            if starts_with_year:
+                external_author = _scan_author_before(text, chunk_start)
+                if external_author:
+                    lead_year = m_lead.group("year")
+                    after_lead = m_lead.group("after") or ""
+                    loc_val, loc_label = _extract_locator(after_lead) if after_lead else ("", "page")
+                    lead_authors = _split_authors(external_author) or [external_author]
+                    leading_inline = Citation(
+                        raw_text=chunk,
+                        authors=lead_authors,
+                        year=lead_year,
+                        style="author-year",
+                        ref_num=None,
+                        paragraph_idx=para_idx,
+                        char_start=chunk_start,
+                        char_end=chunk_start + len(chunk),
+                        in_footnote=in_footnote,
+                        display_text=_build_display_text(lead_authors, lead_year),
+                        locator=loc_val,
+                        locator_label=loc_label,
+                    )
+
             if not sub_units:
                 continue
 
             # Collect citations and their positions for prefix/suffix extraction
             chunk_citations: List[Citation] = []
             all_positions: List[tuple] = []  # (start, end, idx, is_bare)
+            if leading_inline is not None:
+                chunk_citations.append(leading_inline)
+                all_positions.append((m_lead.start(), m_lead.end(), 0, False))
 
             for um in sub_units:
                 raw_authors = um.group("authors")
@@ -784,7 +1005,7 @@ class CitationParser:
             # Extend the author name backwards through preceding capitalised
             # words so that "Swedish Food Agency (2025)" is captured in full
             # rather than just "Agency (2025)".
-            _prev_word = re.compile(r"([A-Za-zÀ-ÿ'\-]+)\s*$")
+            _prev_word = re.compile(r"([A-Za-zÀ-ÿ'’\-]+)\s*$")
             scan_pos = name_start
             while scan_pos > 0:
                 before = text[:scan_pos]
@@ -800,15 +1021,38 @@ class CitationParser:
                     author = word + " " + author
                     scan_pos = pm.start(1)
                     name_start = scan_pos
+                elif word.lower() == "and":
+                    # "and" between two capitalised name words is a co-author
+                    # connector ("Koponen and Niva (2020)"), not a sentence
+                    # boundary. Only include it if a capitalised non-stopword
+                    # name is found immediately before it.
+                    pre_text = text[:pm.start(1)]
+                    pm2 = _prev_word.search(pre_text)
+                    if (
+                        pm2
+                        and pm2.group(1)[0].isupper()
+                        and pm2.group(1) not in _INLINE_STOPWORDS
+                    ):
+                        author = pm2.group(1) + " " + word + " " + author
+                        scan_pos = pm2.start(1)
+                        name_start = scan_pos
+                    else:
+                        break
                 else:
                     break
 
-            display = _build_display_text([author], year)
+            # Split the captured author span on co-author connectors
+            # ("and", "&", ",") so a multi-author inline citation like
+            # "Boltanski and Thévenot (2006)" stores ["Boltanski", "Thévenot"]
+            # instead of one combined string. Also strips a leading initial
+            # without period ("M Nilsson" → "Nilsson") for matcher lookup.
+            authors_list = _split_authors(author) or [author]
+            display = _build_display_text(authors_list, year)
             after_year = m.group(0)[m.end("year") - m.start():].rstrip(")")
             loc_val, loc_label = _extract_locator(after_year)
             results.append(Citation(
                 raw_text=text[name_start:m.end()],
-                authors=[author],
+                authors=authors_list,
                 year=year,
                 style="author-year",
                 ref_num=None,

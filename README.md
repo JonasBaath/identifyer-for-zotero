@@ -22,19 +22,35 @@ Once opened in Word or LibreOffice with the Zotero plugin, the new document beha
 - Python 3.9 or later
 - [Zotero](https://www.zotero.org/) installed locally (the app reads your local SQLite database)
 
-## Installation
-
-```bash
-pip install -r requirements.txt
-```
-
 ## Usage
 
+The launch scripts create a local virtual environment (`.venv/`) on first run and install dependencies automatically.
+
+**macOS / Linux:**
+
 ```bash
-python3 main.py
+./run.sh
+```
+
+**Windows:**
+
+```bat
+run.bat
 ```
 
 The app opens automatically in your default browser at `http://127.0.0.1:7474`.
+
+### Manual installation
+
+If you prefer to manage the environment yourself:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/python main.py
+```
+
+On systems with PEP 668 enforcement (e.g. Homebrew Python on macOS), installing into the system interpreter without a virtual environment will be blocked.
 
 ## Supported formats
 
